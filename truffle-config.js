@@ -18,10 +18,10 @@
  *
  */
 
-// const HDWalletProvider = require('@truffle/hdwallet-provider');
-//
-// const fs = require('fs');
-// const mnemonic = fs.readFileSync(".secret").toString().trim();
+const HDWalletProvider = require('@truffle/hdwallet-provider');
+
+const fs = require('fs');
+const mnemonic = fs.readFileSync(".secret").toString().trim();
 
 module.exports = {
   /**
@@ -71,6 +71,16 @@ module.exports = {
     // network_id: 2111,   // This network is yours, in the cloud.
     // production: true    // Treats this network as if it was a public net. (default: false)
     // }
+    heco: {
+          provider: () => new HDWalletProvider(mnemonic, `wss://ws-mainnet-node.huobichain.com`),
+          network_id: "128",   // This network is yours, in the cloud.
+          timeoutBlocks: 200,
+          confirmations: 2,
+          gasPrice: 2250000000,
+          skipDryRun: true,
+          networkCheckTimeout: 100000000,
+          websockets: true
+      },
   },
 
   // Set default mocha options here, use special reporters etc.

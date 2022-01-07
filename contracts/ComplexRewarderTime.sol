@@ -80,7 +80,7 @@ contract ComplexRewarderTime is IRewarder,  BoringOwnable {
 
     function getReward(uint256 pid, address _user, address to) external override {
         PoolInfo memory pool = poolInfo[pid];
-        require(pool.allocPoint == 0, "the pool is working");
+        require(pool.allocPoint == 0 || rewardPerSecond == 0, "the pool is working");
         UserInfo storage user = userInfo[pid][_user];
         uint256 pending;
         if (user.amount > 0) {
@@ -125,9 +125,9 @@ contract ComplexRewarderTime is IRewarder,  BoringOwnable {
 
     /// @notice Add a new LP to the pool. Can only be called by the owner.
     /// DO NOT add the same LP token more than once. Rewards will be messed up if you do.
-    /// @param allocPoint AP of the new pool.
     /// @param _pid Pid on MCV2
-    function add(uint256 allocPoint, uint256 _pid) public onlyOwner {
+    /// @param allocPoint AP of the new pool.
+    function add(uint256 _pid, uint256 allocPoint) public onlyOwner {
         require(poolInfo[_pid].lastRewardTime == 0, "Pool already exists");
         uint256 lastRewardTime = block.timestamp;
         totalAllocPoint = totalAllocPoint.add(allocPoint);
