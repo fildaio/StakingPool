@@ -4,11 +4,12 @@ pragma solidity 0.6.12;
 pragma experimental ABIEncoderV2;
 
 import "./interfaces/IRewarder.sol";
-import "./boring-solidity/contracts/BoringOwnable.sol";
 import "./boring-solidity/libraries/BoringMath.sol";
 import "./boring-solidity/libraries/BoringERC20.sol";
 import "./boring-solidity/contracts/BoringBatchable.sol";
 import "./libraries/SignedSafeMath.sol";
+import "./LockPool.sol";
+import "./Pausable.sol";
 
 interface IMigratorChef {
     // Take the current LP token address and return the new LP token address.
@@ -21,7 +22,7 @@ interface IMigratorChef {
 /// The idea for this MasterChef V2 (MCV2) contract is therefore to be the owner of a dummy token
 /// that is deposited into the MasterChef V1 (MCV1) contract.
 /// The allocation point for this pool on MCV1 is the total allocation point for all pools that receive double incentives.
-contract MiniChefV2 is BoringOwnable, BoringBatchable {
+contract MiniChefV2 is Pausable, BoringBatchable {
     using BoringMath for uint256;
     using BoringMath128 for uint128;
     using BoringERC20 for IERC20;
@@ -42,6 +43,8 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         uint128 accSushiPerShare;
         uint64 lastRewardTime;
         uint64 allocPoint;
+        address lockPool;
+        uint256 feeMolecular;
     }
 
     /// @notice Address of SUSHI contract.
@@ -64,6 +67,9 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     uint256 public sushiPerSecond;
     uint256 private constant ACC_SUSHI_PRECISION = 1e12;
 
+    uint256 private constant FEE_DENOMINATOR = 10000;
+    address public feeReceiver;
+
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
@@ -72,6 +78,8 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite);
     event LogUpdatePool(uint256 indexed pid, uint64 lastRewardTime, uint256 lpSupply, uint256 accSushiPerShare);
     event LogSushiPerSecond(uint256 sushiPerSecond);
+    event FeeReceiverChanged(address receiver);
+    event Locked(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
 
     /// @param _sushi The SUSHI token contract address.
     constructor(IERC20 _sushi) public {
@@ -88,15 +96,22 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     /// @param allocPoint AP of the new pool.
     /// @param _lpToken Address of the LP ERC-20 token.
     /// @param _rewarder Address of the rewarder delegate.
-    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder) public onlyOwner {
+    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder, address _lockPool) public onlyOwner {
         totalAllocPoint = totalAllocPoint.add(allocPoint);
         lpToken.push(_lpToken);
         rewarder.push(_rewarder);
+        addPause(false);
+
+        if (_lockPool != address(0)) {
+            _lpToken.approve(_lockPool, uint(-1));
+        }
 
         poolInfo.push(PoolInfo({
             allocPoint: allocPoint.to64(),
             lastRewardTime: block.timestamp.to64(),
-            accSushiPerShare: 0
+            accSushiPerShare: 0,
+            lockPool: _lockPool,
+            feeMolecular: 0
         }));
         emit LogPoolAddition(lpToken.length.sub(1), allocPoint, _lpToken, _rewarder);
     }
@@ -111,6 +126,20 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         poolInfo[_pid].allocPoint = _allocPoint.to64();
         if (overwrite) { rewarder[_pid] = _rewarder; }
         emit LogSetPool(_pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite);
+    }
+
+    function setLockPool(uint256 _pid, address _lockPool, uint256 _feeMolecular) public onlyOwner {
+        if (_lockPool != address(0)) {
+            require(LockPool(_lockPool).lpToken() == lpToken[_pid], "lock pool lpToken is not match");
+            lpToken[_pid].approve(_lockPool, uint(-1));
+        }
+        poolInfo[_pid].lockPool = _lockPool;
+        poolInfo[_pid].feeMolecular = _feeMolecular;
+    }
+
+    function setFeeReceiver(address _receiver) public onlyOwner {
+        feeReceiver = _receiver;
+        emit FeeReceiverChanged(_receiver);
     }
 
     /// @notice Sets the sushi per second to be distributed. Can only be called by the owner.
@@ -186,7 +215,7 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     /// @param pid The index of the pool. See `poolInfo`.
     /// @param amount LP token amount to deposit.
     /// @param to The receiver of `amount` deposit benefit.
-    function deposit(uint256 pid, uint256 amount, address to) public {
+    function deposit(uint256 pid, uint256 amount, address to) public whenNotPaused(pid) {
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][to];
 
@@ -223,7 +252,61 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
             _rewarder.onSushiReward(pid, msg.sender, to, 0, user.amount);
         }
         
-        lpToken[pid].safeTransfer(to, amount);
+        if (pool.lockPool == address(0)) {
+            lpToken[pid].safeTransfer(to, amount);
+        } else {
+            LockPool(pool.lockPool).withdraw(to, amount);
+        }
+
+        emit Withdraw(msg.sender, pid, amount, to);
+    }
+
+    /// @notice Apply withdraw lock LP tokens from MCV2.
+    /// @param pid The index of the pool. See `poolInfo`.
+    /// @param amount LP token amount to withdraw.
+    /// @param to Receiver of the LP tokens.
+    function withdrawApplication(uint256 pid, uint256 amount, address to) public {
+        PoolInfo memory pool = updatePool(pid);
+        require(pool.lockPool != address(0), "only lock pool call");
+        UserInfo storage user = userInfo[pid][msg.sender];
+
+        // Effects
+        user.rewardDebt = user.rewardDebt.sub(int256(amount.mul(pool.accSushiPerShare) / ACC_SUSHI_PRECISION));
+        user.amount = user.amount.sub(amount);
+
+        // Interactions
+        IRewarder _rewarder = rewarder[pid];
+        if (address(_rewarder) != address(0)) {
+            _rewarder.onSushiReward(pid, msg.sender, to, 0, user.amount);
+        }
+
+        LockPool(pool.lockPool).lock(to, amount);
+
+        emit Locked(msg.sender, pid, amount, to);
+    }
+
+    /// @notice Force withdraw lock LP tokens from MCV2.
+    /// @param pid The index of the pool. See `poolInfo`.
+    /// @param amount LP token amount to withdraw.
+    /// @param to Receiver of the LP tokens.
+    function withdrawForce(uint256 pid, uint256 amount, address to) public {
+        PoolInfo memory pool = updatePool(pid);
+        require(pool.lockPool != address(0), "only lock pool call");
+        UserInfo storage user = userInfo[pid][msg.sender];
+
+        // Effects
+        user.rewardDebt = user.rewardDebt.sub(int256(amount.mul(pool.accSushiPerShare) / ACC_SUSHI_PRECISION));
+        user.amount = user.amount.sub(amount);
+
+        // Interactions
+        IRewarder _rewarder = rewarder[pid];
+        if (address(_rewarder) != address(0)) {
+            _rewarder.onSushiReward(pid, msg.sender, to, 0, user.amount);
+        }
+
+        uint256 fee = amount.mul(pool.feeMolecular) / FEE_DENOMINATOR;
+        lpToken[pid].safeTransfer(feeReceiver, fee);
+        lpToken[pid].safeTransfer(to, amount.sub(fee));
 
         emit Withdraw(msg.sender, pid, amount, to);
     }
@@ -244,7 +327,7 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         if (_pendingSushi != 0) {
             SUSHI.safeTransfer(to, _pendingSushi);
         }
-        
+
         IRewarder _rewarder = rewarder[pid];
         if (address(_rewarder) != address(0)) {
             _rewarder.onSushiReward( pid, msg.sender, to, _pendingSushi, user.amount);
@@ -275,7 +358,11 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
             _rewarder.onSushiReward(pid, msg.sender, to, _pendingSushi, user.amount);
         }
 
-        lpToken[pid].safeTransfer(to, amount);
+        if (pool.lockPool == address(0)) {
+            lpToken[pid].safeTransfer(to, amount);
+        } else {
+            LockPool(pool.lockPool).withdraw(to, amount);
+        }
 
         emit Withdraw(msg.sender, pid, amount, to);
         emit Harvest(msg.sender, pid, _pendingSushi);
@@ -285,6 +372,8 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     /// @param pid The index of the pool. See `poolInfo`.
     /// @param to Receiver of the LP tokens.
     function emergencyWithdraw(uint256 pid, address to) public {
+        require(poolInfo[pid].lockPool == address(0), "lock pool do not support emergencyWithdraw");
+
         UserInfo storage user = userInfo[pid][msg.sender];
         uint256 amount = user.amount;
         user.amount = 0;
@@ -298,5 +387,21 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         // Note: transfer can fail or succeed if `amount` is zero.
         lpToken[pid].safeTransfer(to, amount);
         emit EmergencyWithdraw(msg.sender, pid, amount, to);
+    }
+
+    function withdrawPeriod(uint256 _pid) external view returns (uint256) {
+        return poolInfo[_pid].lockPool == address(0) ? 0 : LockPool(poolInfo[_pid].lockPool).withdrawPeriod();
+    }
+
+    function lockedBalance(uint256 _pid, address _account) external view returns (uint256) {
+        return poolInfo[_pid].lockPool == address(0) ? 0 : LockPool(poolInfo[_pid].lockPool).lockedBalance(_account);
+    }
+
+    function withdrawTime(uint256 _pid, address _account) external view returns (uint256) {
+        return poolInfo[_pid].lockPool == address(0) ? 0 : LockPool(poolInfo[_pid].lockPool).withdrawTime(_account);
+    }
+
+    function pullRewardToken(uint amount) external onlyOwner {
+        SUSHI.safeTransfer(owner, amount);
     }
 }

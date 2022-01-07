@@ -77,6 +77,23 @@ contract ComplexRewarderTime is IRewarder,  BoringOwnable {
         user.rewardDebt = lpToken.mul(pool.accSushiPerShare) / ACC_TOKEN_PRECISION;
         emit LogOnReward(_user, pid, pending, to);
     }
+
+    function getReward(uint256 pid, address _user, address to) external override {
+        PoolInfo memory pool = poolInfo[pid];
+        require(pool.allocPoint == 0, "the pool is working");
+        UserInfo storage user = userInfo[pid][_user];
+        uint256 pending;
+        if (user.amount > 0) {
+            pending =
+                (user.amount.mul(pool.accSushiPerShare) / ACC_TOKEN_PRECISION).sub(
+                    user.rewardDebt
+                );
+            if (pending == 0) return;
+            rewardToken.safeTransfer(to, pending);
+        }
+        user.rewardDebt = user.amount.mul(pool.accSushiPerShare) / ACC_TOKEN_PRECISION;
+        emit LogOnReward(_user, pid, pending, to);
+    }
     
     function pendingTokens(uint256 pid, address user, uint256) override external view returns (IERC20[] memory rewardTokens, uint256[] memory rewardAmounts) {
         IERC20[] memory _rewardTokens = new IERC20[](1);
@@ -178,4 +195,7 @@ contract ComplexRewarderTime is IRewarder,  BoringOwnable {
         }
     }
 
+    function pullRewardToken(uint amount) external onlyOwner {
+        rewardToken.safeTransfer(owner, amount);
+    }
 }
